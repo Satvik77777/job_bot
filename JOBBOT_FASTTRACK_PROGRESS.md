@@ -3,11 +3,22 @@
 **Last Updated**: 2026-10-29
 **Candidate Profile**: B.Tech Computer Science (2026 Graduate), 0 YOE Confirmed Professional Experience, React / Node.js / TypeScript / Python / SQL core stack.
 **Safety Switches**: `SEND_ENABLED=false`, `DIGEST_SEND_ENABLED=false`, `daily_limit=5`.
-**Workspace Test Suite**: 92/92 unit & integration tests passing in 0.69s (0 failures, 0 errors, 0 ResourceWarnings).
+**Workspace Test Suite**: 93/93 unit & integration tests passing in 0.52s (0 failures, 0 errors, 0 ResourceWarnings).
 
 ---
 
 ## 1. V5 Final Launch Sprint Completed Milestones
+
+- [x] **Strict Job-Relevance, 0-YOE Experience & Freshness Filtering (New Milestone)**:
+  - Excluded jobs with mandatory experience >0 YOE unless stated range explicitly starts at 0 (e.g. 0–1 or 0–2 YOE). Do not mistake preferred experience for mandatory experience.
+  - Implemented `MENTOR_LEAD_PATTERN` matching mentoring phrases; cleaned descriptions so "Mentor junior engineers" never falsely triggers junior keyword matching. Excluded Deepsa AI Automation (4–8 YOE).
+  - Enforced senior, lead, managerial, and architect exclusions across all discovery paths and `evaluate_experience_fit`.
+  - Enforced graduation batch eligibility: excludes programs restricted to non-2026 batches or returning students only.
+  - Added strict date validation in `parse_and_validate_job_date`: uses actual job posting dates (`posted_at` / `date_posted`), prioritizing jobs posted within 72 hours, with an absolute 7-day cutoff. Unreliable or missing posting dates are excluded from the emailed digest. Adjusted FreeHire `posted_within_days` to 7.
+  - Re-filtered existing database records in `send_portal_digest`: stale, non-tech, senior, or unsuitable review records stored in SQLite never resurface in Category B.
+  - Added transparency fields on every digest card: posted date/time, relative age badge (`⏱ 17h ago`), experience requirement, and verification status.
+  - Repaired deployment script (`deploy_jobbot_release.sh`) to deploy the full test suite and enforce cryptographic SHA256 verification between workspace and production with automatic rollback.
+  - Verified by `test_scenario_u_strict_relevance_freshness_and_deepsa_filtering`.
 
 - [x] **Dark Mode Responsive Job Digest Generator (New Milestone)**:
   - Redesigned `send_portal_digest` in `jobbot.py` with default dark mode: `#0B1220` body background, `#0F172A` container, and `#172235` dark slate job cards with subtle `#24354D` borders and soft shadows.

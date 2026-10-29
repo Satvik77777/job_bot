@@ -1066,7 +1066,8 @@ class JobbotTests(unittest.TestCase):
             'company': 'Plane',
             'location': 'India',
             'reason': 'ambiguous experience requirement: held for manual review',
-            'description_skill_matches': ['Node.js', 'TypeScript', 'SQL']
+            'description_skill_matches': ['Node.js', 'TypeScript', 'SQL'],
+            'posted_at': self.clock.isoformat()
         }
         self.db.execute("INSERT OR REPLACE INTO reviews(url, reason, found_at) VALUES(?,?,?)",
                         ('https://jobs.ashbyhq.com/plane/test-1', json.dumps(review_candidate), self.clock.isoformat()))
@@ -1371,7 +1372,7 @@ class TestV4MasterIntegrationScenarios(unittest.TestCase):
             ('p1', 'Associate Software Engineer', 'Razorpay', 'https://job-boards.greenhouse.io/razorpay/1', 'Bengaluru',
              json.dumps(['Node.js', 'React.js']), 2, self.clock.isoformat(), 'pending', self.clock.isoformat()))
         # Add Category B review candidate
-        rev = {'title': 'Backend Developer', 'company': 'Groww', 'location': 'Bengaluru', 'reason': 'held for manual review: ambiguous experience', 'description_skill_matches': ['Node.js']}
+        rev = {'title': 'Backend Developer', 'company': 'Groww', 'location': 'Bengaluru', 'reason': 'held for manual review: ambiguous experience', 'description_skill_matches': ['Node.js'], 'posted_at': self.clock.isoformat()}
         self.db.execute("INSERT INTO reviews(url, reason, found_at) VALUES(?,?,?)",
                         ('https://job-boards.eu.greenhouse.io/groww/2', json.dumps(rev), self.clock.isoformat()))
         self.db.commit()
@@ -1446,7 +1447,8 @@ class TestV4MasterIntegrationScenarios(unittest.TestCase):
             'location': 'India',
             'classification': 'manual_review_only',
             'reason': 'ambiguous experience requirement: held for manual review',
-            'description_skill_matches': ['Node.js', 'TypeScript']
+            'description_skill_matches': ['Node.js', 'TypeScript'],
+            'posted_at': self.clock.isoformat()
         }
         self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)", ('https://example.com/vehant', json.dumps(rev_vehant), self.clock.isoformat()))
         self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)", ('https://example.com/enterpret', json.dumps(rev_enterpret), self.clock.isoformat()))
@@ -1576,7 +1578,8 @@ class TestV4MasterIntegrationScenarios(unittest.TestCase):
             'location': 'Bengaluru',
             'classification': 'manual_review_only',
             'reason': 'ambiguous experience requirement: held for manual review',
-            'description_skill_matches': ['React.js', 'Node.js']
+            'description_skill_matches': ['React.js', 'Node.js'],
+            'posted_at': self.clock.isoformat()
         }
         self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)", ('https://example.com/cred_dark', json.dumps(rev), self.clock.isoformat()))
         self.db.commit()
@@ -1610,6 +1613,184 @@ class TestV4MasterIntegrationScenarios(unittest.TestCase):
             self.assertIn('Category B — Promising Opportunities Held for Manual Review (1)', html)
             self.assertIn('Razorpay', html)
             self.assertIn('Cred', html)
+
+    def test_scenario_u_strict_relevance_freshness_and_deepsa_filtering(self):
+        """Scenario U: Strict experience filtering (0-YOE target), Deepsa exclusion, freshness (<=72h priority, <=7d cutoff, no missing dates), and DB re-filtering."""
+        # 1. Experience & Role Evaluation Unit Checks
+        # Deepsa 4-8 YOE + "Mentor junior engineers"
+        deepsa_desc = "Deepsa AI Automation. Mentor junior engineers and contribute to a culture of technical excellence. Minimum 4-8 years of experience required in backend development."
+        ok_deepsa, reason_deepsa = bot.evaluate_experience_fit(deepsa_desc, "Backend Engineer", None, self.config, self.profile)
+        self.assertFalse(ok_deepsa)
+        self.assertTrue('mentor' in str(reason_deepsa).lower() or 'experience' in str(reason_deepsa).lower())
+
+        # Mandatory 2+ YOE
+        desc_2yoe = "Candidate must possess minimum 2+ years of professional software engineering experience."
+        ok_2yoe, reason_2yoe = bot.evaluate_experience_fit(desc_2yoe, "Software Engineer", None, self.config, self.profile)
+        self.assertFalse(ok_2yoe)
+
+        # Explicit range including 0 (0-1 YOE or 0-2 YOE)
+        desc_0_1 = "Requirements: 0-1 years of experience in Python, Node.js or React."
+        ok_0_1, _ = bot.evaluate_experience_fit(desc_0_1, "Junior Software Engineer", None, self.config, self.profile)
+        self.assertTrue(ok_0_1)
+
+        desc_0_2 = "Open to freshers with 0 to 2 years experience."
+        ok_0_2, _ = bot.evaluate_experience_fit(desc_0_2, "Associate Software Engineer", None, self.config, self.profile)
+        self.assertTrue(ok_0_2)
+
+        # Preferred 2+ YOE without mandatory
+        desc_pref = "Qualifications: B.Tech in CSE. Preferred qualifications: 2+ years experience building web applications."
+        ok_pref, _ = bot.evaluate_experience_fit(desc_pref, "Software Engineer", None, self.config, self.profile)
+        self.assertTrue(ok_pref)
+
+        # Senior/Lead role rejection
+        ok_sr, reason_sr = bot.evaluate_experience_fit("Open to all, 0-1 years experience welcomed.", "Senior Full Stack Developer", None, self.config, self.profile)
+        self.assertFalse(ok_sr)
+        self.assertIn('senior', str(reason_sr).lower())
+
+        # Graduation batch restriction
+        desc_grad_2027 = "Eligibility: Only students currently enrolled and graduating in 2027 or 2028."
+        ok_grad_2027, reason_grad_2027 = bot.evaluate_graduation_eligibility(desc_grad_2027, "Software Engineering Intern")
+        self.assertFalse(ok_grad_2027)
+
+        desc_grad_2026 = "Eligibility: Open to 2026 batch B.Tech/B.E graduates."
+        ok_grad_2026, _ = bot.evaluate_graduation_eligibility(desc_grad_2026, "Graduate Software Engineer")
+        self.assertTrue(ok_grad_2026)
+
+        # 2. Date Parsing & Freshness Filter Checks
+        # Fresh within 72h
+        fresh_time = (self.clock - timedelta(hours=18)).isoformat()
+        dt, age_hours, age_label, is_fresh_72h, is_valid_7d = bot.parse_and_validate_job_date(fresh_time, current_dt=self.clock)
+        self.assertTrue(is_valid_7d)
+        self.assertTrue(is_fresh_72h)
+        self.assertEqual(age_label, '18h ago')
+
+        # Stale (> 7 days)
+        stale_time = (self.clock - timedelta(days=9)).isoformat()
+        _, _, _, _, is_valid_stale = bot.parse_and_validate_job_date(stale_time, current_dt=self.clock)
+        self.assertFalse(is_valid_stale)
+
+        # Missing / Unreliable date
+        _, _, _, _, is_valid_missing = bot.parse_and_validate_job_date(None, current_dt=self.clock)
+        self.assertFalse(is_valid_missing)
+        _, _, _, _, is_valid_invalid = bot.parse_and_validate_job_date("unparseable date string", current_dt=self.clock)
+        self.assertFalse(is_valid_invalid)
+
+        # 3. Database Re-Filtering during Digest Generation
+        # Insert genuine Category A job (fresh, 10h old)
+        self.db.execute('''INSERT INTO portal_jobs(id, title, company, url, location, matching_skills, match_score, date_posted, status, discovered_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)''',
+            ('p_valid', 'Associate Software Engineer', 'FreshWorks', 'https://job-boards.greenhouse.io/freshworks/1', 'Chennai',
+             json.dumps(['Python', 'JavaScript']), 2, (self.clock - timedelta(hours=10)).isoformat(), 'pending', self.clock.isoformat()))
+
+        # Insert Category B candidate: genuine fresh 0-YOE job (20h old)
+        rev_valid = {
+            'title': 'Junior Backend Developer',
+            'company': 'Swiggy',
+            'location': 'Bengaluru',
+            'classification': 'manual_review_only',
+            'reason': 'unverified source held for manual review',
+            'description_skill_matches': ['Python', 'Node.js'],
+            'posted_at': (self.clock - timedelta(hours=20)).isoformat()
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/swiggy', json.dumps(rev_valid), self.clock.isoformat()))
+
+        # Insert previously stored unsuitable / stale records that must NEVER resurface:
+        # a) Deepsa AI Automation (4-8 YOE, mentor junior)
+        rev_deepsa = {
+            'title': 'Backend Engineer',
+            'company': 'Deepsa AI Automation',
+            'location': 'Remote',
+            'classification': 'manual_review_only',
+            'reason': deepsa_desc,
+            'description_skill_matches': ['Node.js'],
+            'posted_at': (self.clock - timedelta(hours=5)).isoformat()
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/deepsa', json.dumps(rev_deepsa), self.clock.isoformat()))
+
+        # b) Stale job (>7 days old)
+        rev_stale = {
+            'title': 'Junior Frontend Developer',
+            'company': 'StaleCorp',
+            'location': 'Bengaluru',
+            'classification': 'manual_review_only',
+            'reason': 'valid fresher role',
+            'description_skill_matches': ['React.js'],
+            'posted_at': (self.clock - timedelta(days=12)).isoformat()
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/stalecorp', json.dumps(rev_stale), self.clock.isoformat()))
+
+        # c) Missing posted_at date
+        rev_no_date = {
+            'title': 'Junior QA Engineer',
+            'company': 'NoDateCorp',
+            'location': 'Noida',
+            'classification': 'manual_review_only',
+            'reason': 'valid role but missing date',
+            'description_skill_matches': ['Python']
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/nodatecorp', json.dumps(rev_no_date), self.clock.isoformat()))
+
+        # d) Senior role in reviews table
+        rev_senior = {
+            'title': 'Lead Software Architect',
+            'company': 'BigTech',
+            'location': 'Hyderabad',
+            'classification': 'manual_review_only',
+            'reason': 'stored lead role',
+            'description_skill_matches': ['Python'],
+            'posted_at': (self.clock - timedelta(hours=6)).isoformat()
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/bigtech', json.dumps(rev_senior), self.clock.isoformat()))
+
+        # e) Incompatible graduation batch
+        rev_batch = {
+            'title': 'Software Intern (2028 batch)',
+            'company': 'FutureTech',
+            'location': 'Remote',
+            'classification': 'manual_review_only',
+            'reason': 'Must be currently enrolled student graduating in 2028 only',
+            'description_skill_matches': ['Python'],
+            'posted_at': (self.clock - timedelta(hours=8)).isoformat()
+        }
+        self.db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?)",
+                        ('https://example.com/futuretech', json.dumps(rev_batch), self.clock.isoformat()))
+
+        self.db.commit()
+
+        # Run digest generation
+        with patch.dict(os.environ, {'DIGEST_SEND_ENABLED': 'false'}):
+            res = bot.send_portal_digest(self.config, self.profile, self.db, force=True)
+
+        self.assertEqual(res['count'], 1)  # Only FreshWorks
+        self.assertEqual(res['review_count'], 1)  # Only Swiggy in Category B!
+
+        p_file = Path(res['preview_file'])
+        self.assertTrue(p_file.exists())
+        content = p_file.read_text(encoding='utf-8')
+
+        # Confirm inclusions
+        self.assertIn('FreshWorks', content)
+        self.assertIn('Swiggy', content)
+
+        # Confirm strict rejections - none of these resurface
+        self.assertNotIn('Deepsa', content)
+        self.assertNotIn('StaleCorp', content)
+        self.assertNotIn('NoDateCorp', content)
+        self.assertNotIn('BigTech', content)
+        self.assertNotIn('FutureTech', content)
+
+        # Check Transparency fields on cards
+        self.assertIn('⏱ 10h ago', content)
+        self.assertIn('⏱ 20h ago', content)
+        self.assertIn('Experience:', content)
+        self.assertIn('Verification:', content)
+        self.assertIn('Verified ATS', content)
+        self.assertIn('Pending Employer Verification', content)
 
 
 if __name__ == '__main__':

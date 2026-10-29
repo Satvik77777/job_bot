@@ -112,15 +112,49 @@ if sudo systemctl is-active --quiet jobbot-dispatch.timer; then
     echo "jobbot-dispatch.timer stopped."
 fi
 
-# 8. Copy modified release files and set permissions
-echo "[8/10] Synchronizing reviewed code files..."
+# 8. Copy modified release files, deploy full test suite, and verify cryptographic hashes
+echo "[8/10] Synchronizing reviewed code files and verifying SHA256 hashes..."
 sudo cp "${WORKSPACE_DIR}/jobbot.py" "${PROD_DIR}/jobbot.py"
 sudo mkdir -p "${PROD_DIR}/tests"
-sudo cp "${WORKSPACE_DIR}/tests/test_jobbot.py" "${PROD_DIR}/tests/test_jobbot.py"
+
+# Deploy all test files from workspace test suite
+for test_file in "${WORKSPACE_DIR}"/tests/*.py; do
+    if [[ -f "${test_file}" ]]; then
+        base_name=$(basename "${test_file}")
+        sudo cp "${test_file}" "${PROD_DIR}/tests/${base_name}"
+    fi
+done
+
 sudo cp "${WORKSPACE_DIR}/JOBBOT_FASTTRACK_PROGRESS.md" "${PROD_DIR}/JOBBOT_FASTTRACK_PROGRESS.md"
 
-sudo chown -R jobbot:jobbot "${PROD_DIR}/jobbot.py" "${PROD_DIR}/tests/test_jobbot.py" "${PROD_DIR}/JOBBOT_FASTTRACK_PROGRESS.md"
-sudo chmod 0644 "${PROD_DIR}/jobbot.py" "${PROD_DIR}/tests/test_jobbot.py" "${PROD_DIR}/JOBBOT_FASTTRACK_PROGRESS.md"
+sudo chown -R jobbot:jobbot "${PROD_DIR}/jobbot.py" "${PROD_DIR}/tests" "${PROD_DIR}/JOBBOT_FASTTRACK_PROGRESS.md"
+sudo chmod 0644 "${PROD_DIR}/jobbot.py" "${PROD_DIR}/JOBBOT_FASTTRACK_PROGRESS.md"
+sudo chmod 0644 "${PROD_DIR}/tests"/*.py
+
+# Cryptographic SHA256 hash verification: Deployment MUST fail if hashes differ
+echo "Verifying SHA256 checksums between workspace and production..."
+for f in "jobbot.py" "tests/test_jobbot.py" "JOBBOT_FASTTRACK_PROGRESS.md"; do
+    ws_hash=$(sha256sum "${WORKSPACE_DIR}/${f}" | awk '{print $1}')
+    prod_hash=$(sha256sum "${PROD_DIR}/${f}" | awk '{print $1}')
+    if [[ "${ws_hash}" != "${prod_hash}" ]]; then
+        echo "==================================================================" >&2
+        echo "ERROR: Cryptographic hash verification failed for ${f}!" >&2
+        echo "Workspace SHA256:  ${ws_hash}" >&2
+        echo "Production SHA256: ${prod_hash}" >&2
+        echo "Aborting deployment and executing code rollback..." >&2
+        echo "==================================================================" >&2
+        sudo cp -p "${ROLLBACK_DIR}/jobbot.py" "${PROD_DIR}/jobbot.py"
+        if [[ -f "${ROLLBACK_DIR}/test_jobbot.py" ]]; then
+            sudo cp -p "${ROLLBACK_DIR}/test_jobbot.py" "${PROD_DIR}/tests/test_jobbot.py"
+        fi
+        sudo chown -R jobbot:jobbot "${PROD_DIR}/jobbot.py" "${PROD_DIR}/tests"
+        if [[ "${TIMER_WAS_ACTIVE}" = true ]]; then
+            sudo systemctl start jobbot-dispatch.timer
+        fi
+        exit 1
+    fi
+    echo "  [OK] ${f}: ${ws_hash:0:16}..."
+done
 
 # 9. Run full production test suite under 'jobbot' user
 echo "[9/10] Running full test suite in production environment..."

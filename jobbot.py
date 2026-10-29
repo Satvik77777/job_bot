@@ -269,6 +269,97 @@ def parse_portal_job_date(value, current_dt=None):
     return parsed, False
 
 
+MENTOR_LEAD_PATTERN = re.compile(
+    r'\b(?:'
+    r'mentor(?:ing|s)?\s+(?:junior|other|team|engineers?|developers?|members?|interns?)|'
+    r'lead(?:ing|s)?\s+(?:a\s+)?(?:team|engineers?|developers?)|'
+    r'guid(?:e|ing|es)\s+(?:junior|other|team)\s+(?:engineers?|developers?)|'
+    r'supervis(?:e|ing|es)\s+(?:junior|team|engineers?)|'
+    r'provide\s+(?:technical\s+)?guidance\s+to\s+(?:junior|team)'
+    r')\b',
+    re.I
+)
+
+SENIOR_ROLES_PATTERN = re.compile(
+    r'\b(senior|sr\.?|lead|principal|staff|manager|architect|director|vp|head|engineer\s*(?:iii|[345])|sde\s*[- ]*(?:iii|[345])|swe\s*[- ]*(?:iii|[345])|level\s*[2345])\b',
+    re.I
+)
+
+
+def parse_and_validate_job_date(value, current_dt=None):
+    """Parse actual job posting date and check 7-day limit & 72-hour freshness.
+
+    Returns (dt_ist, age_hours, age_label, is_fresh_72h, is_valid_7d).
+    If missing, empty, unparseable, in the future, or >7 days old, returns (None, None, None, False, False).
+    """
+    if current_dt is None:
+        current_dt = now()
+    if not value or not isinstance(value, str) or not value.strip():
+        return None, None, None, False, False
+    val = value.strip()
+    try:
+        dt, is_date_only = parse_portal_job_date(val, current_dt)
+    except Exception:
+        try:
+            dt = posted_date(val)
+            if dt > current_dt:
+                return None, None, None, False, False
+        except Exception:
+            return None, None, None, False, False
+
+    age_seconds = (current_dt - dt).total_seconds()
+    if age_seconds < 0:
+        return None, None, None, False, False
+    age_hours = age_seconds / 3600.0
+
+    if age_hours > 7 * 24:  # older than 7 days
+        return dt, age_hours, None, False, False
+
+    is_fresh_72h = (age_hours <= 72.0)
+
+    if age_hours < 1.0:
+        age_label = f"{int(max(1, age_seconds // 60))}m ago"
+    elif age_hours < 24.0:
+        age_label = f"{int(age_hours)}h ago"
+    else:
+        days = int(age_hours // 24)
+        rem_hours = int(age_hours % 24)
+        age_label = f"{days}d {rem_hours}h ago" if rem_hours > 0 else f"{days}d ago"
+
+    return dt, age_hours, age_label, is_fresh_72h, True
+
+
+def extract_experience_display(desc, title, requirements=None):
+    """Extract experience display string for transparency without inventing details."""
+    text = (title + ' ' + (desc or '')).strip()
+    m_range = re.search(r'\b(0\s*[-–—to]\s*[12]\s*(?:years?|yrs?|yoe))\b', text, re.I)
+    if m_range:
+        return m_range.group(1).replace('-', '–')
+    if re.search(r'\b(freshers?|fresher\s+welcome|for\s+freshers?|no\s+prior\s+experience)\b', text, re.I):
+        return 'Fresher (0 YOE)'
+    if re.search(r'\b(interns?|internships?)\b', title, re.I):
+        return 'Internship (Student / Fresher)'
+    if re.search(r'\b(graduate\s+engineer\s+trainee|graduate\s+trainee|trainees?|apprentice)\b', text, re.I):
+        return 'Graduate Trainee / Entry-Level'
+    if re.search(r'\b(sde\s*[- ]?(?:1|i)|swe\s*[- ]?(?:1|i)|software\s+engineer\s*[- ]?(?:1|i)|engineer\s*[- ]?(?:1|i))\b', text, re.I):
+        return 'SDE-1 / Entry-Level'
+    if re.search(r'\b(junior|jr\.?|associates?)\b', title, re.I):
+        return 'Junior / Entry-Level'
+    return 'Not explicitly specified in listing'
+
+
+def evaluate_graduation_eligibility(desc, title):
+    """Exclude internships and programs explicitly restricted to currently enrolled students or incompatible batches."""
+    text = (title + ' ' + (desc or '')).lower()
+    if re.search(r'\b(?:graduating\s+in\s+(?:202[45789]|2030)|(?:2024|2025|2027|2028|2029)\s+(?:batch|graduates?)|only\s+(?:for\s+)?(?:202[45789])|not\s+open\s+to\s+2026)\b', text):
+        if not re.search(r'\b2026\b', text):
+            return False, 'incompatible graduation batch'
+    if re.search(r'\b(?:currently\s+enrolled\s+students?\s+only|must\s+be\s+returning\s+to\s+(?:university|school|college))\b', text):
+        if not re.search(r'\b2026\b', text):
+            return False, 'restricted to currently enrolled students returning to university'
+    return True, None
+
+
 def evaluate_experience_fit(desc, title, requirements, config, profile):
     """Evaluate candidate experience against job requirements.
 
@@ -277,7 +368,16 @@ def evaluate_experience_fit(desc, title, requirements, config, profile):
     and ensures candidate's confirmed experience meets mandatory entry thresholds.
     """
     years = profile.get('years_experience')
+    if years is None:
+        years = 0
     experience_text = desc + ' ' + str(requirements or '')
+
+    # Exclude senior, lead, managerial, and mentoring-heavy roles
+    if not profile.get('allow_senior_roles', False) and SENIOR_ROLES_PATTERN.search(title):
+        return None, 'senior, lead, or managerial role excluded for fresher'
+
+    if MENTOR_LEAD_PATTERN.search(desc):
+        return None, 'mentoring or leadership requirements exclude 0-YOE fresher'
 
     mandatory_minimums = []
     if isinstance(requirements, dict) and 'monthsOfExperience' in requirements:
@@ -298,15 +398,15 @@ def evaluate_experience_fit(desc, title, requirements, config, profile):
     )
 
     range_pattern = re.compile(
-        r'(\d+(?:\.\d+)?)\s*(?:[-–]|to)\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\s*(?:of\s*)?(?:(?:professional|relevant|work|industry|commercial|development)\s+)?(?:experience|exp)?',
+        r'(\d+(?:\.\d+)?)\s*(?:[-–—]|to)\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?|yoe)\s*(?:of\s*)?(?:(?:professional|relevant|work|industry|commercial|development)\s+)?(?:experience|exp)?',
         re.I
     )
     single_pattern = re.compile(
-        r'(?:(?:minimum|at\s+least|experience\s*[:=]?)\s*)?(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s*)?(?:(?:professional|relevant|work|industry|commercial|development)\s+)?(?:experience|exp)?',
+        r'(?:(?:minimum|at\s+least|experience\s*[:=]?)\s*)?(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?|yoe)\s*(?:of\s*)?(?:(?:professional|relevant|work|industry|commercial|development)\s+)?(?:experience|exp)?',
         re.I
     )
     exp_colon_pattern = re.compile(
-        r'experience\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:\+|(?:[-–]|to)\s*(\d+(?:\.\d+)?))?\s*(?:years?|yrs?)',
+        r'experience\s*(?:required)?\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:\+|(?:[-–—]|to)\s*(\d+(?:\.\d+)?))?\s*(?:years?|yrs?|yoe)?',
         re.I
     )
 
@@ -343,13 +443,17 @@ def evaluate_experience_fit(desc, title, requirements, config, profile):
     if not mandatory_minimums and all_found_minimums and any(m > max_role_ceiling for m in all_found_minimums):
         return None, 'role requires more than 2 years experience'
 
+    # Clean desc of mentoring-junior phrases before matching junior keywords
+    clean_desc = MENTOR_LEAD_PATTERN.sub('', desc)
+    clean_desc = re.sub(r'\bmentor(?:ing)?\s+junior\w*', '', clean_desc, flags=re.I)
+
     junior = re.search(
         r'\b(freshers?|entry[ -]level|junior|jr\.?|associates?|interns?|internships?|apprentices?|trainees?|'
         r'early[ -]careers?|(?:recent|new|college)\s+grad(?:uate)?s?|'
         r'graduate\s+(?:software\s+)?(?:engineer|developer|trainee)|graduate\s+engineer\s+trainee|'
         r'sde\s*[- ]?\s*(?:1|i)\b|swe\s*[- ]?\s*(?:1|i)\b|software\s+(?:development\s+)?engineer\s*[- ]?\s*(?:1|i)\b|'
         r'engineer\s*[- ]?\s*(?:1|i)\b)\b',
-        title + ' ' + desc, re.I
+        title + ' ' + clean_desc, re.I
     )
 
     if not all_found_minimums and not junior:
@@ -360,6 +464,7 @@ def evaluate_experience_fit(desc, title, requirements, config, profile):
             return None, 'required experience exceeds profile'
 
     return True, None
+
 
 
 def application_email(description, domains):
@@ -928,7 +1033,7 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
         params = urlencode({
             'q': query,
             'countries': 'in',
-            'posted_within_days': config.get('portal_max_post_age_days', 30),
+            'posted_within_days': 7,
             'limit': 20
         })
         api_url = f"{base_url}?{params}"
@@ -990,8 +1095,25 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
             desc = plain(str(item.get('description', ''))).strip()
             posted_val = item.get('posted_at')
 
-            # 1. Senior role filter (Category C)
-            senior = re.search(r'\b(senior|sr\.?|lead|principal|staff|manager|architect|director|vp|head)\b', title, re.I)
+            # 1. Freshness check: must have actual job posting timestamp within 7 days
+            dt_posted, age_hours, age_label, is_fresh_72h, is_valid_7d = parse_and_validate_job_date(posted_val, now())
+            if not is_valid_7d:
+                rev = {
+                    'source': 'freehire_discovery',
+                    'company': company,
+                    'title': title,
+                    'location': loc,
+                    'url': canon_url,
+                    'posted_at': posted_val,
+                    'classification': 'ineligible',
+                    'reason': 'posting date missing, unparseable, or older than 7 days'
+                }
+                db.execute('INSERT OR REPLACE INTO reviews VALUES(?,?,?)', (canon_url, json.dumps(rev, ensure_ascii=False), now().isoformat()))
+                added_reviews += 1
+                continue
+
+            # 2. Senior role filter (Category C)
+            senior = SENIOR_ROLES_PATTERN.search(title)
             if senior and not profile.get('allow_senior_roles', False):
                 rev = {
                     'source': 'freehire_discovery',
@@ -999,6 +1121,7 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                     'title': title,
                     'location': loc,
                     'url': canon_url,
+                    'posted_at': posted_val,
                     'classification': 'ineligible',
                     'reason': 'senior role excluded by profile'
                 }
@@ -1006,15 +1129,48 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                 added_reviews += 1
                 continue
 
-            # 2. Technical role check
+            # 3. Technical role check
             if not ROLES.search(title) and not any(kw in title.lower() for kw in ['engineer', 'developer', 'programmer', 'sde', 'swe', 'trainee', 'node', 'react', 'backend', 'frontend', 'full stack']):
                 continue
 
-            # 3. Non-software discipline exclusion (Mechanical, Civil, Chemical, etc.)
-            if re.search(r'\b(mechanical|civil|chemical|electrical|metallurgy|mining|chemist|pharmacist|sales|content writer)\b', title, re.I):
+            # 4. Non-software discipline exclusion (Mechanical, Civil, Chemical, etc.)
+            if re.search(r'\b(mechanical|civil|chemical|electrical|metallurgy|mining|chemist|pharmacist|sales|content writer|telecom|bpo|voice)\b', title, re.I):
                 continue
 
-            # 4. Experience fit evaluation
+            # 5. Mentoring and Deepsa exclusion
+            if MENTOR_LEAD_PATTERN.search(desc) or 'deepsa' in company.lower():
+                rev = {
+                    'source': 'freehire_discovery',
+                    'company': company,
+                    'title': title,
+                    'location': loc,
+                    'url': canon_url,
+                    'posted_at': posted_val,
+                    'classification': 'ineligible',
+                    'reason': 'mentoring or leadership requirements exclude 0-YOE fresher'
+                }
+                db.execute('INSERT OR REPLACE INTO reviews VALUES(?,?,?)', (canon_url, json.dumps(rev, ensure_ascii=False), now().isoformat()))
+                added_reviews += 1
+                continue
+
+            # 6. Graduation eligibility
+            grad_ok, grad_reason = evaluate_graduation_eligibility(desc, title)
+            if not grad_ok:
+                rev = {
+                    'source': 'freehire_discovery',
+                    'company': company,
+                    'title': title,
+                    'location': loc,
+                    'url': canon_url,
+                    'posted_at': posted_val,
+                    'classification': 'ineligible',
+                    'reason': grad_reason
+                }
+                db.execute('INSERT OR REPLACE INTO reviews VALUES(?,?,?)', (canon_url, json.dumps(rev, ensure_ascii=False), now().isoformat()))
+                added_reviews += 1
+                continue
+
+            # 7. Experience fit evaluation
             exp_ok, exp_reason = evaluate_experience_fit(desc, title, None, config, profile)
             if not exp_ok:
                 rev = {
@@ -1023,6 +1179,7 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                     'title': title,
                     'location': loc,
                     'url': canon_url,
+                    'posted_at': posted_val,
                     'classification': 'ineligible',
                     'reason': exp_reason or 'required experience exceeds profile'
                 }
@@ -1030,10 +1187,10 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                 added_reviews += 1
                 continue
 
-            # 5. Matching skills
+            # 8. Matching skills
             matched_skills = [s for s in profile.get('skills', []) if skill_matches(s, title + ' ' + desc)]
 
-            # 6. Authenticity evaluation: Is it a verified corporate ATS or third-party listing?
+            # 9. Authenticity evaluation: Is it a verified corporate ATS or third-party listing?
             host = (urlsplit(canon_url).hostname or '').lower()
             is_direct_ats = any(host == h or host.endswith('.' + h) for h in ats_hosts) or host.startswith('careers.')
 
@@ -1055,7 +1212,25 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                     added_portal += 1
                     continue
 
-            # 7. Third-party listing or unverified employer -> Category B manual review
+            # 10. Third-party listing or unverified employer -> Category B manual review
+            # Must still establish plausible 0-YOE fresher eligibility
+            is_junior_title = bool(re.search(r'\b(junior|jr\.?|intern|internship|fresher|freshers|entry[ -]?level|associate|trainee|apprentice|graduate|sde\s*[- ]?(?:1|i)\b|swe\s*[- ]?(?:1|i)\b|software\s+(?:development\s+)?engineer\s*[- ]?(?:1|i)\b)\b', title, re.I))
+            has_fresher_signal = bool(re.search(r'\b(0\s*[-–—to]\s*[12]\s*(?:years?|yrs?|yoe)|0\s*(?:years?|yrs?|yoe)|fresher|freshers|entry[ -]?level|0\s*yoe|for\s+freshers|no\s+experience\s+required)\b', title + ' ' + desc, re.I))
+            if not is_junior_title and not has_fresher_signal:
+                rev = {
+                    'source': 'freehire_discovery',
+                    'company': company,
+                    'title': title,
+                    'location': loc,
+                    'url': canon_url,
+                    'posted_at': posted_val,
+                    'classification': 'ineligible',
+                    'reason': 'generic title does not establish fresher or 0-2 year eligibility'
+                }
+                db.execute('INSERT OR REPLACE INTO reviews VALUES(?,?,?)', (canon_url, json.dumps(rev, ensure_ascii=False), now().isoformat()))
+                added_reviews += 1
+                continue
+
             third_party = item.get('source') or host
             rev_candidate = {
                 'source': 'freehire_discovery',
@@ -1071,6 +1246,7 @@ def freehire_discover(config, profile, sources, db, fetcher=None):
                 'match_score': len(matched_skills)
             }
             db.execute('INSERT OR REPLACE INTO reviews VALUES(?,?,?)', (canon_url, json.dumps(rev_candidate, ensure_ascii=False), now().isoformat()))
+
             added_reviews += 1
 
         db.commit()
@@ -1803,6 +1979,7 @@ def send_portal_digest(config, profile, db, force=False):
         ORDER BY match_score DESC, date_posted DESC
     ''').fetchall()
     portal_max_days = config.get('portal_max_post_age_days')
+    portal_max_hours = config.get('max_post_age_hours', 168)
     jobs = []
     for row in rows:
         job = dict(row)
@@ -1813,58 +1990,164 @@ def send_portal_digest(config, profile, db, force=False):
         if not posted:
             db.execute("UPDATE portal_jobs SET status='expired_outdated' WHERE id=? AND status='pending'", (job['id'],))
             continue
+
+        # Respect max_post_age_hours (e.g. 12h) or portal_max_days, and enforce absolute 7-day limit (168h)
         if portal_max_days is not None:
             stale = (current.date() - posted.date()).days > portal_max_days if is_date_only else posted < current - timedelta(days=portal_max_days)
         else:
-            stale = posted > current or posted < current - timedelta(hours=config['max_post_age_hours'])
+            stale = posted > current or posted < current - timedelta(hours=portal_max_hours)
+
+        if not stale and posted < current - timedelta(days=7):
+            stale = True
+
         if stale or posted > current:
             db.execute("UPDATE portal_jobs SET status='expired_outdated' WHERE id=? AND status='pending'", (job['id'],))
             continue
+
+        # Experience fit verification
+        desc_text = job.get('description', '')
+        if desc_text:
+            exp_ok, exp_reason = evaluate_experience_fit(desc_text, job['title'], job.get('experienceRequirements'), config, profile)
+            if not exp_ok:
+                db.execute("UPDATE portal_jobs SET status='ineligible_experience' WHERE id=? AND status='pending'", (job['id'],))
+                continue
+            grad_ok, grad_reason = evaluate_graduation_eligibility(desc_text, job['title'])
+            if not grad_ok:
+                db.execute("UPDATE portal_jobs SET status='ineligible_graduation' WHERE id=? AND status='pending'", (job['id'],))
+                continue
+
+        age_seconds = (current - posted).total_seconds()
+        age_hours = age_seconds / 3600.0
+        is_fresh_72h = (age_hours <= 72.0)
+        if age_hours < 1.0:
+            age_label = f"{int(max(1, age_seconds // 60))}m ago"
+        elif age_hours < 24.0:
+            age_label = f"{int(age_hours)}h ago"
+        else:
+            days = int(age_hours // 24)
+            rem_hours = int(age_hours % 24)
+            age_label = f"{days}d {rem_hours}h ago" if rem_hours > 0 else f"{days}d ago"
+
+        job['dt_posted'] = posted
+        job['age_hours'] = age_hours
+        job['age_label'] = age_label
+        job['is_fresh_72h'] = is_fresh_72h
+        job['exp_display'] = extract_experience_display(desc_text, job['title'], job.get('experienceRequirements'))
+        job['verification_status'] = 'Verified ATS (Corporate Portal)'
         jobs.append(job)
     db.commit()
+
+
+    # Prioritize jobs posted within 72 hours, then recency, then match score
     jobs.sort(key=lambda j: (
-        compute_priority_score(j, profile, config) if j.get('description') else j.get('match_score', 0),
-        j.get('match_score', 0)
-    ), reverse=True)
-    review_rows = db.execute("SELECT url, reason, found_at FROM reviews ORDER BY found_at DESC LIMIT 50").fetchall()
+        0 if j['is_fresh_72h'] else 1,
+        j['age_hours'],
+        -(compute_priority_score(j, profile, config) if j.get('description') else j.get('match_score', 0))
+    ))
+
+    review_rows = db.execute("SELECT url, reason, found_at FROM reviews ORDER BY found_at DESC").fetchall()
     review_candidates = []
     seen_review_urls = set()
     for rr in review_rows:
         try:
             ev = json.loads(rr['reason'])
-            if isinstance(ev, dict):
-                t = str(ev.get('title', ''))
-                reason_str = str(ev.get('reason') or ev.get('classification') or '')
-                # Filter out clearly ineligible roles from Category B (promising manual review)
-                # Unmet mandatory criteria (Category C) must not masquerade as promising manual review
-                ineligible_markers = [
-                    'senior role', 'payment/scam', 'requires more than 2 years', 'scam indicator',
-                    'exceeds profile', 'ineligible', 'role closed', 'posting expired', 'unmet mandatory',
-                    'tier-1', 'prior relevant internship'
-                ]
-                if any(x in reason_str.lower() for x in ineligible_markers) or ev.get('classification', '').lower() == 'ineligible':
+            if not isinstance(ev, dict):
+                continue
+
+            posted_val = ev.get('posted_at') or ev.get('date_posted') or ev.get('datePosted')
+            # Missing or unparseable posting date: retain in DB for audit, exclude from emailed digest
+            dt_posted, age_hours, age_label, is_fresh_72h, is_valid_7d = parse_and_validate_job_date(posted_val, current)
+            if not is_valid_7d:
+                continue
+
+            t = str(ev.get('title', '')).strip()
+            comp = str(ev.get('company', '')).strip() or 'Unknown Company'
+            reason_str = str(ev.get('reason') or ev.get('classification') or '')
+            desc = str(ev.get('description', '')).strip()
+            comb = t + ' ' + desc + ' ' + reason_str
+
+            # Ineligible markers
+            if ev.get('classification', '').lower() == 'ineligible':
+                continue
+            ineligible_markers = [
+                'senior role', 'payment/scam', 'requires more than 2 years', 'scam indicator',
+                'exceeds profile', 'ineligible', 'role closed', 'posting expired', 'unmet mandatory',
+                'tier-1', 'prior relevant internship', 'mentoring or leadership', 'incompatible graduation'
+            ]
+            if any(x in reason_str.lower() for x in ineligible_markers):
+                continue
+
+            # Senior / Managerial role exclusion
+            if SENIOR_ROLES_PATTERN.search(t) and not profile.get('allow_senior_roles', False):
+                continue
+
+            # Non-software discipline exclusion
+            if re.search(r'\b(mechanical|civil|chemical|electrical|metallurgy|mining|chemist|pharmacist|sales|content writer|telecom|bpo|voice|finance|analyst|executive|cluster)\b', t, re.I):
+                continue
+
+            # Mentoring / Leadership heavy role exclusion (e.g. Deepsa AI Automation)
+            if MENTOR_LEAD_PATTERN.search(comb) or 'deepsa' in comp.lower():
+                continue
+
+            # Mandatory experience > 0 check
+            if desc:
+                exp_ok, exp_reason = evaluate_experience_fit(desc, t, None, config, profile)
+                if not exp_ok:
                     continue
-                if re.search(r'\b(senior|sr\.?|lead|principal|staff|manager|architect|director|vp|head)\b', t, re.I) and not profile.get('allow_senior_roles', False):
-                    continue
-                url_c = canonical(rr['url'])
-                if url_c in seen_review_urls:
-                    continue
-                if ROLES.search(t) or any(kw in t.lower() for kw in ['engineer', 'developer', 'intern', 'node', 'react', 'python', 'sde']):
-                    seen_review_urls.add(url_c)
-                    review_candidates.append({
-                        'url': url_c,
-                        'title': t or 'Software Engineering Opportunity',
-                        'company': ev.get('company') or 'Unknown Company',
-                        'location': ev.get('location') or 'India / Remote',
-                        'reason': reason_str or 'Held for manual review',
-                        'skills': ev.get('description_skill_matches', [])
-                    })
+            if re.search(r'\b(?:4[-–—to]8|[3-9]|\d{2,})\+?\s*(?:years?|yrs?|yoe)\b', comb, re.I):
+                continue
+            if re.search(r'\b[1-9]\d*\s*[-–—to]\s*\d+\s*(?:years?|yrs?|yoe)\b', comb, re.I):
+                continue
+            if re.search(r'\b(?:minimum|at\s+least|must\s+have)\s+[1-9]\d*\+?\s*(?:years?|yrs?|yoe)\b', comb, re.I):
+                continue
+
+            # Graduation batch restriction check
+            grad_ok, grad_reason = evaluate_graduation_eligibility(desc, t)
+            if not grad_ok:
+                continue
+
+            # Plausible 0-YOE fresher eligibility check
+            is_junior_title = bool(re.search(r'\b(junior|jr\.?|intern|internship|fresher|freshers|entry[ -]?level|associate|trainee|apprentice|graduate|sde\s*[- ]?(?:1|i)\b|swe\s*[- ]?(?:1|i)\b|software\s+(?:development\s+)?engineer\s*[- ]?(?:1|i)\b)\b', t, re.I))
+            has_fresher_signal = bool(re.search(r'\b(0\s*[-–—to]\s*[12]\s*(?:years?|yrs?|yoe)|0\s*(?:years?|yrs?|yoe)|fresher|freshers|entry[ -]?level|0\s*yoe|for\s+freshers|no\s+experience\s+required)\b', comb, re.I))
+            is_ambiguous_review = bool('ambiguous experience requirement' in reason_str.lower() or 'manual review' in reason_str.lower())
+            if not is_junior_title and not has_fresher_signal and not is_ambiguous_review:
+                continue
+
+            url_c = canonical(rr['url'])
+            if url_c in seen_review_urls:
+                continue
+            seen_review_urls.add(url_c)
+
+            third_party = ev.get('third_party_source') or ev.get('source') or ''
+            verification_status = f"Manual Review (Unverified Source: {third_party.title()})" if third_party else "Manual Review (Pending Employer Verification)"
+
+            review_candidates.append({
+                'url': url_c,
+                'title': t or 'Software Engineering Opportunity',
+                'company': comp,
+                'location': ev.get('location') or 'India / Remote',
+                'reason': reason_str or 'Held for manual review',
+                'skills': ev.get('description_skill_matches', []),
+                'posted_val': posted_val,
+                'dt_posted': dt_posted,
+                'age_hours': age_hours,
+                'age_label': age_label,
+                'is_fresh_72h': is_fresh_72h,
+                'exp_display': extract_experience_display(desc, t),
+                'verification_status': verification_status
+            })
         except Exception:
             pass
 
+    # Prioritize review roles posted within 72 hours, then recency
+    review_candidates.sort(key=lambda r: (
+        0 if r['is_fresh_72h'] else 1,
+        r['age_hours']
+    ))
+
     if not jobs and not review_candidates:
         LOG.info('No portal jobs or review candidates to include in digest')
-        return {'mode': 'no_jobs', 'count': 0}
+        return {'mode': 'no_jobs', 'count': 0, 'review_count': 0}
 
     lines_txt = [
         f"SATVIK'S PRIORITY PORTAL JOBS & REFERRAL DIGEST - {current.strftime('%Y-%m-%d %H:%M')} IST",
@@ -1905,12 +2188,20 @@ def send_portal_digest(config, profile, db, force=False):
         team_message_html = html.escape(referral_msg_team)
         person_message_html = html.escape(referral_msg_person)
         posted_html = html.escape(j['date_posted'][:16].replace('T', ' '))
+        age_label = j.get('age_label', 'Recent')
+        age_badge_color = "#34D399" if j.get('is_fresh_72h') else "#FBBF24"
+        age_badge_bg = "#064E3B" if j.get('is_fresh_72h') else "#451A03"
+        age_badge_border = "#059669" if j.get('is_fresh_72h') else "#B45309"
+        exp_display = html.escape(j.get('exp_display', 'Fresher / 0–1 YOE'))
+        verif_status = html.escape(j.get('verification_status', 'Verified ATS (Corporate Portal)'))
 
         lines_txt.extend([
             f"#{idx}. {j['title']} @ {j['company']} (Ref ID: {job_ref})",
             f"Location: {j.get('location', 'N/A')}",
+            f"Verification: {verif_status}",
+            f"Experience: {exp_display}",
+            f"Posted: {j['date_posted']} ({age_label})",
             f"Salary Target Fit: ₹40,000+/mo in-hand (~6.0 - 7.5+ LPA CTC)",
-            f"Posted: {j['date_posted']}",
             f"Skill Match Score: {j['match_score']} matched ({skills_str})",
             f"Portal Apply Link: {j['url']}",
             "LinkedIn Referral Searches (Click to connect with employees):",
@@ -1930,13 +2221,14 @@ def send_portal_digest(config, profile, db, force=False):
             <div class="card-header-flex" style="display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #24354D; padding-bottom: 12px; margin-bottom: 14px;">
                 <h3 style="margin: 0; color: #F8FAFC; font-size: 21px; font-weight: 700; line-height: 1.4;">#{idx}. {title_html}</h3>
                 <div class="card-badge-right" style="margin-left: 12px; white-space: nowrap;">
+                    <span style="background-color: {age_badge_bg}; color: {age_badge_color}; border: 1px solid {age_badge_border}; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 6px; margin-right: 6px;">⏱ {age_label}</span>
                     <span style="background-color: #064E3B; color: #34D399; border: 1px solid #059669; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 6px; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 6px;">Category A</span>
                     <span style="background-color: #0C4A6E; color: #7DD3FC; border: 1px solid #0284C7; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 6px;">Score: {j['match_score']} Skills</span>
                 </div>
             </div>
             <p style="margin: 6px 0; color: #CBD5E1; font-size: 15px;"><strong style="color: #94A3B8;">Company:</strong> <span style="color: #F8FAFC; font-weight: 700;">{company_html}</span> &bull; <strong style="color: #94A3B8;">Job Ref ID:</strong> <span style="font-family: monospace; font-weight: 700; color: #38BDF8; background-color: #0F1A2C; padding: 2px 6px; border-radius: 4px; border: 1px solid #1E293B;">{job_ref}</span> &bull; <strong style="color: #94A3B8;">City:</strong> <span style="color: #E2E8F0;">{location_html}</span></p>
-            <p style="margin: 6px 0; color: #CBD5E1; font-size: 15px;"><strong style="color: #94A3B8;">Target Fit:</strong> <span style="color: #34D399; font-weight: 600;">₹40,000+/month in-hand (~6.0 - 7.5+ LPA CTC)</span> &bull; <strong style="color: #94A3B8;">Posted:</strong> <span style="color: #94A3B8;">{posted_html} IST</span></p>
-            <p style="margin: 8px 0; color: #CBD5E1; font-size: 15px;"><strong style="color: #94A3B8;">Matched Skills:</strong> <span style="color: #93C5FD; font-weight: 600; background-color: #0F1A2C; padding: 3px 8px; border-radius: 4px; border: 1px solid #1E293B;">{skills_html}</span></p>
+            <p style="margin: 6px 0; color: #CBD5E1; font-size: 15px;"><strong style="color: #94A3B8;">Posted:</strong> <span style="color: #F8FAFC; font-weight: 600;">{posted_html} IST</span> &bull; <strong style="color: #94A3B8;">Experience:</strong> <span style="color: #34D399; font-weight: 600;">{exp_display}</span> &bull; <strong style="color: #94A3B8;">Verification:</strong> <span style="color: #38BDF8; font-weight: 600;">{verif_status}</span></p>
+            <p style="margin: 6px 0; color: #CBD5E1; font-size: 15px;"><strong style="color: #94A3B8;">Target Fit:</strong> <span style="color: #34D399; font-weight: 600;">₹40,000+/month in-hand (~6.0 - 7.5+ LPA CTC)</span> &bull; <strong style="color: #94A3B8;">Matched Skills:</strong> <span style="color: #93C5FD; font-weight: 600; background-color: #0F1A2C; padding: 3px 8px; border-radius: 4px; border: 1px solid #1E293B;">{skills_html}</span></p>
             <div style="margin: 18px 0 14px 0;">
                 <a href="{job_url_html}" target="_blank" style="display: inline-block; background-color: #2563EB; color: #FFFFFF; text-decoration: none; padding: 11px 24px; border-radius: 6px; font-weight: 700; font-size: 15px; border: 1px solid #3B82F6; box-shadow: 0 2px 4px rgba(37, 99, 235, 0.3);">👉 Apply on Career Portal</a>
             </div>
@@ -1967,15 +2259,25 @@ def send_portal_digest(config, profile, db, force=False):
         r_skills_html = f'<p style="margin: 6px 0 0 0; color: #94A3B8; font-size: 14px;"><strong style="color: #CBD5E1;">Matched Skills:</strong> <span style="color: #93C5FD; background-color: #0F1A2C; border: 1px solid #1E293B; padding: 2px 8px; border-radius: 4px; font-weight: 500;">{r_skills_str}</span></p>' if r_skills_str else ''
         r_refs = generate_referral_links(rj['company'], rj.get('location', 'India'))
         r_refs_html = {k: html.escape(v, quote=True) for k, v in r_refs.items()}
+        r_age_label = rj.get('age_label', 'Active')
+        r_age_badge_color = "#34D399" if rj.get('is_fresh_72h') else "#FBBF24"
+        r_age_badge_bg = "#064E3B" if rj.get('is_fresh_72h') else "#451A03"
+        r_age_badge_border = "#059669" if rj.get('is_fresh_72h') else "#B45309"
+        r_exp_display = html.escape(rj.get('exp_display', 'Fresher / Entry-Level'))
+        r_posted_html = html.escape(rj['dt_posted'].strftime('%Y-%m-%d %H:%M') if rj.get('dt_posted') else 'Recent')
+        r_verif_status = html.escape(rj.get('verification_status', 'Manual Review (Pending Employer Verification)'))
+
         review_cards.append(f"""
         <div style="background-color: #172235; border: 1px solid #2B3A4F; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.4);">
             <div class="card-header-flex" style="display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #24354D; padding-bottom: 10px; margin-bottom: 12px;">
                 <h4 style="margin: 0; color: #F8FAFC; font-size: 19px; font-weight: 700; line-height: 1.4;">#{r_idx}. {r_title} <span style="color: #38BDF8; font-weight: 400;">@</span> {r_comp}</h4>
                 <div class="card-badge-right" style="margin-left: 12px; white-space: nowrap;">
+                    <span style="background-color: {r_age_badge_bg}; color: {r_age_badge_color}; border: 1px solid {r_age_badge_border}; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 6px; margin-right: 6px;">⏱ {r_age_label}</span>
                     <span style="background-color: #451A03; color: #FBBF24; border: 1px solid #B45309; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 6px; text-transform: uppercase; letter-spacing: 0.5px;">Manual Review</span>
                 </div>
             </div>
-            <p style="margin: 6px 0; font-size: 15px; color: #CBD5E1;"><strong style="color: #94A3B8;">Location:</strong> {r_loc}</p>
+            <p style="margin: 6px 0; font-size: 15px; color: #CBD5E1;"><strong style="color: #94A3B8;">Location:</strong> {r_loc} &bull; <strong style="color: #94A3B8;">Posted:</strong> <span style="color: #F8FAFC; font-weight: 600;">{r_posted_html} IST</span></p>
+            <p style="margin: 6px 0; font-size: 15px; color: #CBD5E1;"><strong style="color: #94A3B8;">Experience:</strong> <span style="color: #FBBF24; font-weight: 600;">{r_exp_display}</span> &bull; <strong style="color: #94A3B8;">Status:</strong> <span style="color: #93C5FD; font-weight: 500;">{r_verif_status}</span></p>
             <div style="background-color: #241416; border: 1px solid #7F1D1D; border-left: 4px solid #EF4444; border-radius: 6px; padding: 10px 14px; margin: 12px 0;">
                 <strong style="color: #F87171; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">Reason Held:</strong>
                 <span style="color: #FCA5A5; font-size: 14px; font-weight: 500; margin-left: 6px;">{r_reason}</span>
@@ -1989,6 +2291,7 @@ def send_portal_digest(config, profile, db, force=False):
             </div>
         </div>
         """)
+
 
     body_txt = "\n".join(lines_txt)
     cat_a_html = "".join(html_cards) if html_cards else '<div style="background-color: #172235; border: 1px dashed #334155; border-radius: 8px; padding: 20px; color: #94A3B8; font-size: 15px; font-style: italic;">0 currently pending in active queue (strict 0-YOE fresher and graduation-year gating active).</div>'

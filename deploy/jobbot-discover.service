@@ -1,0 +1,16 @@
+[Unit]
+Description=Discover verified software jobs for Satvik
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=jobbot
+Group=jobbot
+WorkingDirectory=/opt/satvik-jobbot
+EnvironmentFile=/opt/satvik-jobbot/.env
+ExecStart=/usr/bin/python3 /opt/satvik-jobbot/jobbot.py discover
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/satvik-jobbot/data /opt/satvik-jobbot/output

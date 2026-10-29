@@ -1,0 +1,12 @@
+.env
+profile.json
+sources.json
+resumes/
+data/
+output/
+__pycache__/
+*.pyc
+.venv/
+*.xlsx
+*.pdf
+scratch/

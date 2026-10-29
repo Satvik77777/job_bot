@@ -1,0 +1,11 @@
+[Unit]
+Description=Optional two-hour discovery; unnecessary when using the dispatch tick timer
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2h
+Persistent=true
+Unit=jobbot-discover.service
+
+[Install]
+WantedBy=timers.target

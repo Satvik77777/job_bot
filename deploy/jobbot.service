@@ -1,0 +1,23 @@
+[Unit]
+Description=Satvik personal job applications API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jobbot
+Group=jobbot
+WorkingDirectory=/opt/satvik-jobbot
+EnvironmentFile=/opt/satvik-jobbot/.env
+ExecStart=/usr/bin/python3 /opt/satvik-jobbot/jobbot.py serve
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/satvik-jobbot/data /opt/satvik-jobbot/output
+
+[Install]
+WantedBy=multi-user.target

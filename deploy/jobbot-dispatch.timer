@@ -1,0 +1,10 @@
+[Unit]
+Description=Check paced application queue every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+Unit=jobbot-dispatch.service
+
+[Install]
+WantedBy=timers.target
